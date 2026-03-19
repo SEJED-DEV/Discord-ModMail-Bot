@@ -48,6 +48,7 @@ Open `modmail.py` and update the following constants to match your server setup:
 | `MODMAIL_CATEGORY_NAME` | The name of the category where ticket channels will live. |
 | `LOG_CHANNEL_NAME` | The name of the channel where transcripts will be sent. |
 | `STAFF_ROLE_NAME` | The exact name of your moderator/support role. |
+| `DISCORD_BOT_TOKEN` | You can find it at the end of the `modmail.py` file. |
 
 ### 3. Deployment
 Install the required library and run the bot:
