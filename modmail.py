@@ -1,17 +1,36 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import asyncio
 import datetime
 import logging
 import sys
 import io
 import re
+import json
+import os
 from collections import defaultdict
+from pathlib import Path
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
 
 LOG_FILE = "modmail.log"
-MODMAIL_CATEGORY_NAME = "Modmail"
+DATA_DIR = "modmail_data"
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.json")
+TRANSCRIPTS_DIR = os.path.join(DATA_DIR, "transcripts")
+
+MODMAIL_CATEGORY_NAME = "Valeria Modmail"
 LOG_CHANNEL_NAME = "modmail-logs"
-STAFF_ROLE_NAME = "your_staff_role_name"
+STAFF_ROLE_NAME = "[-]   Support Team"
+
+AUTO_SAVE_INTERVAL = 60  # Auto-save every 60 seconds
+BACKUP_INTERVAL = 3600   # Backup every hour
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LOGGING SETUP
+# ═══════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -30,16 +49,244 @@ logging.getLogger("discord").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
 logging.getLogger("discord.gateway").setLevel(logging.WARNING)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# BOT SETUP
+# ═══════════════════════════════════════════════════════════════════════════
+
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# In-memory state (backed by persistent storage)
 open_tickets = {}
 claimed_tickets = {}
 ticket_messages = defaultdict(list)
-anonymous_mode = {}
+blacklisted_users = set()
 
 bot_start_time = datetime.datetime.now(datetime.timezone.utc)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PERSISTENT STORAGE FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ensure_data_directory():
+    """Create data directory structure if it doesn't exist."""
+    Path(DATA_DIR).mkdir(exist_ok=True)
+    Path(TRANSCRIPTS_DIR).mkdir(exist_ok=True)
+    log("info", f"[STORAGE] Data directory ensured at {DATA_DIR}")
+
+
+def serialize_datetime(obj):
+    """JSON serializer for datetime objects."""
+    if isinstance(obj, datetime.datetime):
+        return obj.isoformat()
+    raise TypeError(f"Type {type(obj)} not serializable")
+
+
+def deserialize_datetime(date_string):
+    """Convert ISO format string back to datetime."""
+    if date_string:
+        return datetime.datetime.fromisoformat(date_string)
+    return None
+
+
+def save_state():
+    """Save all bot state to disk."""
+    try:
+        state = {
+            "open_tickets": {},
+            "claimed_tickets": claimed_tickets,
+            "ticket_messages": {},
+            "last_save": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }
+        
+        # Convert ticket data to serializable format
+        for user_id, ticket in open_tickets.items():
+            state["open_tickets"][str(user_id)] = {
+                "channel_id": ticket["channel_id"],
+                "guild_id": ticket["guild_id"],
+                "opened_at": ticket["opened_at"].isoformat()
+            }
+        
+        # Convert messages to serializable format
+        for user_id, messages in ticket_messages.items():
+            state["ticket_messages"][str(user_id)] = [
+                {
+                    "sender": msg["sender"],
+                    "content": msg["content"],
+                    "timestamp": msg["timestamp"].isoformat(),
+                    "anonymous": msg.get("anonymous", False)
+                }
+                for msg in messages
+            ]
+        
+        # Write to temp file first, then rename (atomic operation)
+        temp_file = STATE_FILE + ".tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        os.replace(temp_file, STATE_FILE)
+        
+        log("debug", f"[STORAGE] State saved successfully ({len(open_tickets)} tickets)")
+        return True
+    except Exception as e:
+        log("error", f"[STORAGE] Failed to save state: {e}")
+        return False
+
+
+def load_state():
+    """Load bot state from disk."""
+    global open_tickets, claimed_tickets, ticket_messages
+    
+    if not os.path.exists(STATE_FILE):
+        log("info", "[STORAGE] No existing state file found, starting fresh")
+        return False
+    
+    try:
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        
+        # Restore open tickets
+        open_tickets.clear()
+        for user_id_str, ticket in state.get("open_tickets", {}).items():
+            user_id = int(user_id_str)
+            open_tickets[user_id] = {
+                "channel_id": ticket["channel_id"],
+                "guild_id": ticket["guild_id"],
+                "opened_at": deserialize_datetime(ticket["opened_at"])
+            }
+        
+        # Restore claimed tickets
+        claimed_tickets.clear()
+        claimed_tickets.update(state.get("claimed_tickets", {}))
+        
+        # Restore messages
+        ticket_messages.clear()
+        for user_id_str, messages in state.get("ticket_messages", {}).items():
+            user_id = int(user_id_str)
+            ticket_messages[user_id] = [
+                {
+                    "sender": msg["sender"],
+                    "content": msg["content"],
+                    "timestamp": deserialize_datetime(msg["timestamp"]),
+                    "anonymous": msg.get("anonymous", False)
+                }
+                for msg in messages
+            ]
+        
+        last_save = state.get("last_save", "unknown")
+        log("info", f"[STORAGE] State loaded successfully: {len(open_tickets)} tickets, last saved at {last_save}")
+        return True
+    except Exception as e:
+        log("error", f"[STORAGE] Failed to load state: {e}")
+        return False
+
+
+def save_blacklist():
+    """Save blacklist to disk."""
+    try:
+        data = {"blacklisted": list(blacklisted_users)}
+        with open(BLACKLIST_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        log("debug", f"[STORAGE] Blacklist saved ({len(blacklisted_users)} users)")
+        return True
+    except Exception as e:
+        log("error", f"[STORAGE] Failed to save blacklist: {e}")
+        return False
+
+
+def load_blacklist():
+    """Load blacklist from disk."""
+    global blacklisted_users
+    
+    if not os.path.exists(BLACKLIST_FILE):
+        log("info", "[STORAGE] No existing blacklist file found")
+        return False
+    
+    try:
+        with open(BLACKLIST_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        blacklisted_users = set(data.get("blacklisted", []))
+        log("info", f"[STORAGE] Blacklist loaded ({len(blacklisted_users)} users)")
+        return True
+    except Exception as e:
+        log("error", f"[STORAGE] Failed to load blacklist: {e}")
+        return False
+
+
+def save_transcript_to_file(user_id, user_name, transcript_text):
+    """Save a transcript to a permanent file."""
+    try:
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        filename = f"transcript-{user_id}-{timestamp}.txt"
+        filepath = os.path.join(TRANSCRIPTS_DIR, filename)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(transcript_text)
+        
+        log("info", f"[TRANSCRIPT] Saved to {filepath}")
+        return filepath
+    except Exception as e:
+        log("error", f"[TRANSCRIPT] Failed to save transcript for {user_id}: {e}")
+        return None
+
+
+def create_backup():
+    """Create a timestamped backup of the current state."""
+    try:
+        if not os.path.exists(STATE_FILE):
+            return False
+        
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_file = os.path.join(DATA_DIR, f"state_backup_{timestamp}.json")
+        
+        import shutil
+        shutil.copy2(STATE_FILE, backup_file)
+        
+        log("info", f"[BACKUP] Created backup: {backup_file}")
+        
+        # Clean old backups (keep last 10)
+        backups = sorted([f for f in os.listdir(DATA_DIR) if f.startswith("state_backup_")])
+        if len(backups) > 10:
+            for old_backup in backups[:-10]:
+                os.remove(os.path.join(DATA_DIR, old_backup))
+                log("debug", f"[BACKUP] Removed old backup: {old_backup}")
+        
+        return True
+    except Exception as e:
+        log("error", f"[BACKUP] Failed to create backup: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BACKGROUND TASKS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@tasks.loop(seconds=AUTO_SAVE_INTERVAL)
+async def auto_save_task():
+    """Automatically save state at regular intervals."""
+    if open_tickets or ticket_messages:
+        save_state()
+
+
+@tasks.loop(seconds=BACKUP_INTERVAL)
+async def backup_task():
+    """Create periodic backups."""
+    create_backup()
+
+
+@auto_save_task.before_loop
+async def before_auto_save():
+    await bot.wait_until_ready()
+
+
+@backup_task.before_loop
+async def before_backup():
+    await bot.wait_until_ready()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc)
@@ -100,6 +347,7 @@ def get_ticket_owner(channel) -> int | None:
     Reads the channel topic first (most reliable), then falls back to
     legacy ticket-{user_id} channel name format.
     """
+    # Primary: topic contains "(user_id)"
     if channel.topic:
         match = re.search(r'\((\d{15,20})\)', channel.topic)
         if match:
@@ -132,7 +380,7 @@ async def log_to_discord(guild, embed):
         try:
             await channel.send(embed=embed)
         except discord.Forbidden:
-            pass
+            log("warning", f"[LOG] Cannot send to log channel in {guild}")
 
 
 async def build_transcript(user, messages):
@@ -159,6 +407,7 @@ async def send_with_images(destination, embed, attachments: list):
             img_embed.set_image(url=attachment.url)
             await destination.send(embed=img_embed)
         else:
+            # Non-image file — send as a link
             await destination.send(f"📎 **Attachment:** {attachment.url}")
 
 
@@ -211,6 +460,9 @@ async def open_ticket(guild, user, first_message=None, attachments=None):
             "anonymous": False
         })
 
+    # Save state immediately after opening ticket
+    save_state()
+
     log("info", f"[TICKET OPEN] {user} ({user.id}) | Channel: #{channel.name} | Guild: {guild}")
     await log_to_discord(guild, build_embed(
         "Ticket Opened",
@@ -222,45 +474,81 @@ async def open_ticket(guild, user, first_message=None, attachments=None):
     return channel, "ok"
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # EVENTS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 
 @bot.event
 async def on_ready():
+    # ── Initialize storage ────────────────────────────────────────────────
+    ensure_data_directory()
+    
+    # ── Load persistent data ──────────────────────────────────────────────
+    load_blacklist()
+    load_state()
+    
+    # ── Restore/verify tickets from channels ──────────────────────────────
     restored = 0
+    verified = 0
     for guild in bot.guilds:
         category = discord.utils.get(guild.categories, name=MODMAIL_CATEGORY_NAME)
         if not category:
             continue
+        
         for channel in category.text_channels:
             user_id = get_ticket_owner(channel)
-            if user_id and user_id not in open_tickets:
+            if not user_id:
+                continue
+            
+            if user_id in open_tickets:
+                # Verify existing ticket
+                ticket = open_tickets[user_id]
+                if ticket["channel_id"] != channel.id:
+                    log("warning", f"[RESTORE] Channel ID mismatch for user {user_id}, updating")
+                    ticket["channel_id"] = channel.id
+                verified += 1
+            else:
+                # Restore ticket not in state
                 open_tickets[user_id] = {
                     "channel_id": channel.id,
                     "guild_id": guild.id,
                     "opened_at": now()
                 }
-                ticket_messages[user_id] = []
+                if user_id not in ticket_messages:
+                    ticket_messages[user_id] = []
                 restored += 1
                 log("info", f"[RESTORE] Restored ticket for user ID {user_id} from #{channel.name}")
-
-                # ── Rename old ticket-{user_id} channels to ticket-{username} ──
-                if re.match(r"^ticket-\d+$", channel.name):
-                    try:
-                        user = await bot.fetch_user(user_id)
-                        safe_name = sanitize_channel_name(user.name)
-                        new_name = f"ticket-{safe_name}"
-                        await channel.edit(name=new_name)
-                        log("info", f"[RENAME] #{channel.name} → #{new_name} for user {user}")
-                    except Exception as e:
-                        log("warning", f"[RENAME] Could not rename #{channel.name}: {e}")
-
+            
+            # ── Rename old ticket-{user_id} channels ──────────────────────
+            if re.match(r"^ticket-\d+$", channel.name):
+                try:
+                    user = await bot.fetch_user(user_id)
+                    safe_name = sanitize_channel_name(user.name)
+                    new_name = f"ticket-{safe_name}"
+                    await channel.edit(name=new_name)
+                    log("info", f"[RENAME] #{channel.name} → #{new_name} for user {user}")
+                except Exception as e:
+                    log("warning", f"[RENAME] Could not rename #{channel.name}: {e}")
+    
+    # Save state after restoration
+    if restored > 0:
+        save_state()
+    
+    # ── Start background tasks ────────────────────────────────────────────
+    if not auto_save_task.is_running():
+        auto_save_task.start()
+        log("info", "[TASKS] Auto-save task started")
+    
+    if not backup_task.is_running():
+        backup_task.start()
+        log("info", "[TASKS] Backup task started")
+    
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="DMs for modmail"),
         status=discord.Status.online
     )
-    log("info", f"Modmail bot online: {bot.user} | Guilds: {len(bot.guilds)} | Restored tickets: {restored}")
+    
+    log("info", f"Modmail bot online: {bot.user} | Guilds: {len(bot.guilds)} | Tickets: {len(open_tickets)} (restored: {restored}, verified: {verified})")
 
 
 @bot.event
@@ -304,8 +592,10 @@ async def handle_dm(message):
     if not guild:
         return
 
-    if hasattr(bot, "blacklisted") and user.id in bot.blacklisted:
+    # Check blacklist
+    if user.id in blacklisted_users:
         await user.send(embed=error_embed("You are blacklisted from using modmail."))
+        log("info", f"[BLACKLIST] Blocked DM from {user} ({user.id})")
         return
 
     if user.id not in open_tickets:
@@ -327,6 +617,7 @@ async def handle_dm(message):
 
     channel = bot.get_channel(ticket["channel_id"])
     if not channel:
+        log("error", f"[DM] Could not find channel {ticket['channel_id']} for ticket of user {user.id}")
         return
 
     embed = build_embed(
@@ -349,13 +640,16 @@ async def handle_dm(message):
         "anonymous": False
     })
 
+    # Save state after receiving message
+    save_state()
+
     log("info", f"[DM] {user} ({user.id}) sent a message to ticket #{channel.name}")
     await message.add_reaction("✅")
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # STAFF COMMANDS (used inside ticket channels)
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 
 def staff_only():
     async def predicate(ctx):
@@ -410,6 +704,9 @@ async def reply(ctx, *, message: str = ""):
         "anonymous": False
     })
 
+    # Save state after reply
+    save_state()
+
     log("info", f"[REPLY] {ctx.author} replied to ticket for {user} ({user_id})")
 
 
@@ -460,6 +757,9 @@ async def anonreply(ctx, *, message: str = ""):
         "anonymous": True
     })
 
+    # Save state after anonymous reply
+    save_state()
+
     log("info", f"[ANON REPLY] {ctx.author} sent anonymous reply to ticket for {user} ({user_id})")
 
 
@@ -475,7 +775,13 @@ async def close(ctx, *, reason: str = "No reason provided"):
     except discord.NotFound:
         user = None
 
-    transcript_text = await build_transcript(user or ctx.author, ticket_messages.get(user_id, []))
+    # Build and save transcript
+    messages = ticket_messages.get(user_id, [])
+    transcript_text = await build_transcript(user or ctx.author, messages)
+    
+    # Save to persistent storage
+    saved_path = save_transcript_to_file(user_id, str(user) if user else "unknown", transcript_text)
+    
     transcript_file = discord.File(
         fp=io.BytesIO(transcript_text.encode("utf-8")),
         filename=f"transcript-{user_id}-{now().strftime('%Y%m%d-%H%M%S')}.txt"
@@ -488,9 +794,10 @@ async def close(ctx, *, reason: str = "No reason provided"):
             f"**User:** `{user}` (`{user_id}`)\n"
             f"**Closed by:** {ctx.author.mention}\n"
             f"**Reason:** {reason}\n"
-            f"**Messages:** {len(ticket_messages.get(user_id, []))}",
+            f"**Messages:** {len(messages)}\n"
+            f"**Saved:** `{saved_path or 'Failed to save'}`",
             color=discord.Color.red(),
-            footer=f"Transcript attached below"
+            footer=f"Transcript attached and saved to disk"
         )
         await log_channel.send(embed=log_embed, file=transcript_file)
 
@@ -504,13 +811,17 @@ async def close(ctx, *, reason: str = "No reason provided"):
             )
             await user.send(embed=close_embed)
         except discord.Forbidden:
-            pass
+            log("warning", f"[CLOSE] Could not DM user {user} ({user_id}) about ticket closure")
 
+    # Remove ticket from state
     open_tickets.pop(user_id, None)
     claimed_tickets.pop(user_id, None)
     ticket_messages.pop(user_id, None)
 
-    await ctx.send(embed=success_embed(f"Ticket closed. Transcript saved to {log_channel.mention if log_channel else '#' + LOG_CHANNEL_NAME}."))
+    # Save state immediately after closing
+    save_state()
+
+    await ctx.send(embed=success_embed(f"Ticket closed. Transcript saved to {log_channel.mention if log_channel else '#' + LOG_CHANNEL_NAME} and disk."))
     log("info", f"[TICKET CLOSE] {ctx.author} closed ticket for user ID {user_id} | Reason: {reason}")
 
     await asyncio.sleep(3)
@@ -585,6 +896,7 @@ async def claim(ctx):
         return await ctx.send(embed=error_embed(f"This ticket is already claimed by **{claimed_tickets[user_id]}**."))
 
     claimed_tickets[user_id] = str(ctx.author)
+    save_state()
     await ctx.send(embed=success_embed(f"Ticket claimed by {ctx.author.mention}."))
     log("info", f"[CLAIM] {ctx.author} claimed ticket for user ID {user_id}")
 
@@ -600,6 +912,7 @@ async def unclaim(ctx):
         return await ctx.send(embed=error_embed("This ticket has not been claimed."))
 
     claimed_tickets.pop(user_id)
+    save_state()
     await ctx.send(embed=success_embed("Ticket unclaimed."))
     log("info", f"[UNCLAIM] {ctx.author} unclaimed ticket for user ID {user_id}")
 
@@ -607,9 +920,8 @@ async def unclaim(ctx):
 @bot.command()
 @staff_only()
 async def blacklist(ctx, user: discord.User, *, reason: str = "No reason provided"):
-    if not hasattr(bot, "blacklisted"):
-        bot.blacklisted = set()
-    bot.blacklisted.add(user.id)
+    blacklisted_users.add(user.id)
+    save_blacklist()
     await ctx.send(embed=success_embed(f"**{user}** has been blacklisted from modmail.\nReason: {reason}"))
     log("info", f"[BLACKLIST] {ctx.author} blacklisted {user} ({user.id}) | Reason: {reason}")
 
@@ -617,16 +929,78 @@ async def blacklist(ctx, user: discord.User, *, reason: str = "No reason provide
 @bot.command()
 @staff_only()
 async def unblacklist(ctx, user: discord.User):
-    if not hasattr(bot, "blacklisted") or user.id not in bot.blacklisted:
+    if user.id not in blacklisted_users:
         return await ctx.send(embed=error_embed(f"**{user}** is not blacklisted."))
-    bot.blacklisted.discard(user.id)
+    blacklisted_users.discard(user.id)
+    save_blacklist()
     await ctx.send(embed=success_embed(f"**{user}** has been removed from the blacklist."))
     log("info", f"[UNBLACKLIST] {ctx.author} unblacklisted {user} ({user.id})")
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def forcesave(ctx):
+    """Manually trigger a state save."""
+    success = save_state()
+    if success:
+        await ctx.send(embed=success_embed(f"State saved successfully. Tickets: {len(open_tickets)}"))
+    else:
+        await ctx.send(embed=error_embed("Failed to save state. Check logs."))
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def forcebackup(ctx):
+    """Manually create a backup."""
+    success = create_backup()
+    if success:
+        await ctx.send(embed=success_embed("Backup created successfully."))
+    else:
+        await ctx.send(embed=error_embed("Failed to create backup. Check logs."))
+
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def botstats(ctx):
+    """Display bot statistics and health."""
+    uptime = now() - bot_start_time
+    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    minutes, _ = divmod(remainder, 60)
+    
+    total_messages = sum(len(msgs) for msgs in ticket_messages.values())
+    
+    state_exists = os.path.exists(STATE_FILE)
+    state_size = os.path.getsize(STATE_FILE) if state_exists else 0
+    
+    fields = [
+        ("Bot Uptime", f"{hours}h {minutes}m", True),
+        ("Open Tickets", str(len(open_tickets)), True),
+        ("Total Messages", str(total_messages), True),
+        ("Claimed Tickets", str(len(claimed_tickets)), True),
+        ("Blacklisted Users", str(len(blacklisted_users)), True),
+        ("Guilds", str(len(bot.guilds)), True),
+        ("State File", f"{state_size / 1024:.1f} KB" if state_exists else "Not found", True),
+        ("Auto-save", "Running" if auto_save_task.is_running() else "Stopped", True),
+        ("Backup Task", "Running" if backup_task.is_running() else "Stopped", True),
+    ]
+    
+    embed = build_embed(
+        "Bot Statistics",
+        f"Modmail system health and metrics",
+        color=discord.Color.blue(),
+        fields=fields,
+        footer=f"Data directory: {DATA_DIR}"
+    )
+    await ctx.send(embed=embed)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # GENERAL COMMANDS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 
 @bot.command()
 async def help(ctx):
@@ -658,12 +1032,21 @@ async def help(ctx):
         ("!opentickets", "List all currently open tickets", False),
         ("!setup", "Create the modmail category and log channel", False),
     ]
+    
+    if ctx.author.guild_permissions.administrator:
+        fields.extend([
+            ("─" * 40, "**Admin Commands**", False),
+            ("!forcesave", "Manually save bot state to disk", False),
+            ("!forcebackup", "Create a backup of the current state", False),
+            ("!botstats", "Display bot statistics and health", False),
+        ])
+    
     embed = build_embed(
         "Modmail Staff Commands",
         "These commands are only available inside ticket channels.",
         color=discord.Color.blurple(),
         fields=fields,
-        footer="Modmail System"
+        footer="Modmail System v2.0 with Persistent Storage"
     )
     await ctx.send(embed=embed)
 
@@ -689,10 +1072,13 @@ async def setup(ctx):
         ("Log Channel", log_channel.mention, True),
         ("Staff Role", STAFF_ROLE_NAME, True),
         ("Prefix", "!", True),
+        ("Data Directory", DATA_DIR, False),
+        ("Auto-save Interval", f"{AUTO_SAVE_INTERVAL}s", True),
+        ("Backup Interval", f"{BACKUP_INTERVAL}s ({BACKUP_INTERVAL // 3600}h)", True),
     ]
     embed = build_embed(
         "Modmail Setup Complete",
-        "The modmail system is ready. Users can now DM the bot to open a ticket.",
+        "The modmail system is ready with persistent storage enabled.\nTranscripts will be automatically saved to disk.",
         color=discord.Color.green(),
         fields=fields
     )
@@ -721,4 +1107,52 @@ async def opentickets(ctx):
     await ctx.send(embed=embed)
 
 
-bot.run("your_bot_token_here")
+# ═══════════════════════════════════════════════════════════════════════════
+# GRACEFUL SHUTDOWN
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def shutdown():
+    """Graceful shutdown handler."""
+    log("info", "[SHUTDOWN] Initiating graceful shutdown...")
+    
+    # Stop background tasks
+    auto_save_task.stop()
+    backup_task.stop()
+    
+    # Final save
+    log("info", "[SHUTDOWN] Performing final state save...")
+    save_state()
+    save_blacklist()
+    
+    # Create final backup
+    create_backup()
+    
+    log("info", "[SHUTDOWN] Shutdown complete. All data saved.")
+
+
+@bot.event
+async def on_disconnect():
+    log("warning", "[CONNECTION] Bot disconnected from Discord")
+
+
+@bot.event
+async def on_resumed():
+    log("info", "[CONNECTION] Bot reconnected to Discord")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RUN BOT
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    try:
+        bot.run("YOUR_BOT_TOKEN_HERE")
+    except KeyboardInterrupt:
+        log("info", "[SHUTDOWN] Keyboard interrupt received")
+        import asyncio
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(shutdown())
+    except Exception as e:
+        log("error", f"[FATAL] Bot crashed: {e}")
+        save_state()
+        save_blacklist()
