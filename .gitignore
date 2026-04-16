@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Bot data (persistent state — back this up separately)
+modmail_data/
+
+# Log file
+modmail.log
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
